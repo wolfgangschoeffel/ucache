@@ -14,7 +14,16 @@ class Cache {
         'text/plain' => 'txt',
     );
 
-    function __construct($dir, $types=NULL) {
+    // declared rather than created on the fly, because PHP 8.2
+    // deprecates dynamic properties
+    public $dir;
+    public $types;
+    public $extensions;
+    public $invalidation_callbacks;
+    public $cache_key_params;
+    public $cache_key_path;
+
+    function __construct($dir, $types=NULL, $options=array()) {
         $this->dir = $dir;
         if (isset($types) && !count($types)) {
             throw new \Exception('$types cannot be empty');
@@ -26,6 +35,54 @@ class Cache {
         }
         $this->extensions = array_values($this->types);
         $this->invalidation_callbacks = array();
+
+        // which query parameters are part of the cache key. NULL
+        // (the default) means all of them - the upstream behaviour,
+        // for a site whose responses depend on $_GET. an array is a
+        // whitelist; an empty array means no query parameter is ever
+        // part of the key, for a site where the router already
+        // ignores the query string and no route reads $_GET, so
+        // keying on it would only let a distinct query string fill
+        // the cache with a new file for no reason.
+        //
+        // this is a fixed setting for the whole process, not derived
+        // per request, so serve() and add() always agree - there is
+        // no route lookup involved that could know more by the time
+        // add() runs than it did when serve() ran.
+        $this->cache_key_params = NULL;
+        if (array_key_exists('cache_key_params', $options)) {
+            $params = $options['cache_key_params'];
+            if (isset($params) && !is_array($params)) {
+                throw new \Exception(
+                    'cache_key_params must be an array or NULL');
+            }
+            if (isset($params)) {
+                foreach ($params as $param) {
+                    self::assert_usable_param_name($param);
+                }
+            }
+            $this->cache_key_params = $params;
+        }
+
+        // the path part of the cache key. NULL (the default) means
+        // work it out from REQUEST_URI here.
+        //
+        // a caller that routes requests itself should pass the path
+        // its router matched on instead, because whatever the router
+        // considers the same page has to end up under the same key.
+        // if the router trims repeated slashes but the cache doesn't,
+        // then //x/ and /x are one page and two cache entries, and
+        // anyone can add a slash to get another file.
+        $this->cache_key_path = NULL;
+        if (array_key_exists('cache_key_path', $options)) {
+            $key_path = $options['cache_key_path'];
+            if (isset($key_path) && !is_string($key_path)) {
+                throw new \Exception(
+                    'cache_key_path must be a string or NULL');
+            }
+            $this->cache_key_path = $key_path;
+        }
+
         self::assert_sha256_available();
     }
 
@@ -147,7 +204,46 @@ class Cache {
     }
 
     function get_current_uri() {
-        return urldecode($_SERVER['REQUEST_URI']);
+        // split before decoding, so that an encoded ? inside a path
+        // segment can't truncate the key
+        $parts = explode('?', $_SERVER['REQUEST_URI'], 2);
+        $query = isset($parts[1]) ? $parts[1] : '';
+        $path = isset($this->cache_key_path)
+            ? $this->cache_key_path
+            : urldecode($parts[0]);
+
+        // NULL: upstream behaviour, the whole query string is part
+        // of the key
+        if (!isset($this->cache_key_params)) {
+            return $query === '' ? $path : $path . '?' . urldecode($query);
+        }
+
+        // an array: only the listed parameters are part of the key.
+        // anything else - utm_source, fbclid, junk - is dropped, so
+        // it can't multiply cache entries for the same page. an
+        // empty array means no query parameter matters at all.
+        if (!$this->cache_key_params || $query === '') {
+            return $path;
+        }
+
+        $query_params = array();
+        parse_str($query, $query_params);
+
+        // build the key from our own list rather than from what came
+        // in, so parameter order can't produce two entries for the
+        // same content either
+        $key_params = array();
+        foreach ($this->cache_key_params as $param) {
+            if (isset($query_params[$param])) {
+                $key_params[$param] = $query_params[$param];
+            }
+        }
+
+        if (!$key_params) {
+            return $path;
+        }
+
+        return $path . '?' . http_build_query($key_params);
     }
 
     function get_extension_from_header() {
@@ -197,6 +293,30 @@ class Cache {
             return $last_part;
         }
         return NULL;
+    }
+
+    // parse_str rewrites some characters in parameter names - a dot
+    // or a space becomes an underscore - so a whitelist entry
+    // containing one could never match anything and would silently
+    // drop the parameter it was meant to keep. rather than reimplement
+    // parse_str's rules and risk them drifting, ask parse_str itself
+    // whether the name survives a round trip.
+    static function assert_usable_param_name($param) {
+        if (!is_string($param) || $param === '') {
+            throw new \Exception(
+                'cache_key_params entries must be non-empty strings');
+        }
+        $parsed = array();
+        parse_str("$param=1", $parsed);
+        if (!array_key_exists($param, $parsed)) {
+            $became = array_keys($parsed);
+            $became = count($became) ? "'{$became[0]}'" : 'nothing';
+            throw new \Exception(
+                "cache_key_params entry '$param' can never match:"
+                    . " PHP's parse_str() turns it into $became, so the"
+                    . ' parameter would always be dropped from the cache'
+                    . ' key. use that name instead, or drop the entry.');
+        }
     }
 
     static function assert_sha256_available() {
